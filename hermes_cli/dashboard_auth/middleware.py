@@ -177,13 +177,11 @@ def _auto_sso_response(request: Request) -> Response | None:
 
     # list_session_providers() already filters on supports_session=True, so
     # token-only credentials (drain/service providers) are never candidates.
-    # Password-only providers (supports_password=True) should never receive
-    # the one-shot OAuth auto-SSO treatment because they have no usable
-    # OAuth start/login flow.
-    providers = [
-        p for p in list_session_providers()
-        if not getattr(p, "supports_password", False)
-    ]
+    # We must decide based on TOTAL interactive provider cardinality: any
+    # 2+ providers must render /login for chooser UX. Only a *single* provider
+    # can be auto-routed to /auth/login, and password-only providers must stay
+    # out of that auto-SSO flow.
+    providers = list_session_providers()
     if len(providers) != 1:
         # Zero → nothing to redirect to. Two+ → user must choose at /login.
         return None
@@ -191,6 +189,10 @@ def _auto_sso_response(request: Request) -> Response | None:
     from hermes_cli.dashboard_auth.prefix import prefix_from_request
 
     provider = providers[0]
+    if getattr(provider, "supports_password", False):
+        # Password-only providers should not auto-initiate OAuth login.
+        return None
+
     prefix = prefix_from_request(request)
     next_param = _safe_next_target(request)
     from urllib.parse import quote

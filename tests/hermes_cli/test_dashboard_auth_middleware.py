@@ -574,6 +574,29 @@ def test_password_only_provider_does_not_auto_sso(_gated_state):
     assert r2.status_code == 200
 
 
+def test_mixed_password_and_oauth_provider_renders_login(_gated_state):
+    """A mixed provider set must keep chooser UX and not auto-SSO.
+
+    Contract: when more than one session provider exists, the middleware must
+    show /login (and encode next=) so the user chooses the auth path. This
+    applies even when exactly one OAuth provider and one password provider are
+    registered.
+    """
+    register_provider(
+        BasicAuthProvider(
+            username="admin",
+            password_hash=hash_password("hunter2"),
+            secret=b"unit-test-secret-16b",
+        )
+    )
+    register_provider(StubAuthProvider())
+
+    client = _gated_state()
+    r = client.get("/observability", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/login?next=%2Fobservability"
+
+
 def test_unreachable_first_provider_does_not_block_second(_gated_state):
     """An unreachable provider registered FIRST must not 503 a request whose
     token a later provider can verify.
