@@ -56,15 +56,27 @@ Every claim must end in exactly one of:
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
-## Outputs and the review-required convention
+## Native review lane
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
+For code-changing tasks, use the durable native `review` state rather than a
+`blocked` reason prefixed `review-required:`. That legacy convention is
+deprecated: `blocked` means a genuine blocker only.
 
-- **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
-- **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
-- **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
+- `submit_for_review(summary=..., metadata=..., reviewer_assignee=...)` closes
+  the writer run, retains workspace/artifact evidence, and moves the card to
+  `review`. It is idempotent and does **not** clean a workspace or promote
+  dependents.
+- The reviewer is separate from the writer: the default reviewer is `default`,
+  while the original implementation owner is retained for audit and revision.
+- A reviewer accepts with the ordinary completion path (`review` → `done`), or
+  uses the native revise transition (`review` → `ready`) to return the same
+  card to its recorded writer. No duplicate fixback card is created.
+- Missing reviewer identity, required skill, workspace, artifacts, or approval
+  must fail closed. Review acceptance does not authorize merge, deployment,
+  publish, credentials, or external side effects.
 
-The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+The native review queue is DB/dispatcher-owned. Notification or session wake
+failures are side-channel failures and cannot remove a `review` row.
 
 ## Logs and audit trail
 

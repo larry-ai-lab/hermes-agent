@@ -914,6 +914,11 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # The implementation owner remains durable while a separate reviewer owns
+    # a review run. ``assignee`` switches to the active lane owner only while
+    # status=review; these fields preserve the boundary for audit and revise.
+    writer_assignee: Optional[str] = None
+    reviewer_assignee: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -997,6 +1002,12 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            writer_assignee=(
+                row["writer_assignee"] if "writer_assignee" in keys else None
+            ),
+            reviewer_assignee=(
+                row["reviewer_assignee"] if "reviewer_assignee" in keys else None
             ),
         )
 
@@ -1175,7 +1186,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Durable lane ownership. The writer identity is captured at native review
+    -- submission; the reviewer becomes active only for the review run.
+    writer_assignee      TEXT,
+    reviewer_assignee    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1985,6 +2000,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "writer_assignee" not in cols:
+        _add_column_if_missing(conn, "tasks", "writer_assignee", "writer_assignee TEXT")
+    if "reviewer_assignee" not in cols:
+        _add_column_if_missing(conn, "tasks", "reviewer_assignee", "reviewer_assignee TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -4535,6 +4554,83 @@ def edit_completed_task_result(
             },
             run_id=run_id,
         )
+    return True
+
+
+def submit_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    reviewer_assignee: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Durably hand an implementation run to the native ``review`` lane.
+
+    Unlike :func:`complete_task`, this retains workspaces and does not promote
+    dependents. Repeated submission is a no-op, so retrying delivery cannot
+    create a second reviewer run.
+    """
+    reviewer = _canonical_assignee(reviewer_assignee or "default")
+    if not reviewer:
+        raise ValueError("reviewer_assignee is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        writer = row["assignee"]
+        sql = """
+            UPDATE tasks SET status='review', assignee=?, writer_assignee=?,
+                reviewer_assignee=?, claim_lock=NULL, claim_expires=NULL,
+                worker_pid=NULL, block_kind=NULL
+            WHERE id=? AND status IN ('running', 'ready')
+        """
+        params: tuple = (reviewer, writer, reviewer, task_id)
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params += (int(expected_run_id),)
+        if conn.execute(sql, params).rowcount != 1:
+            return False
+        run_id = _end_run(conn, task_id, outcome="submitted_for_review",
+                          status="review", summary=summary, metadata=metadata)
+        if run_id is None:
+            run_id = _synthesize_ended_run(conn, task_id,
+                outcome="submitted_for_review", summary=summary, metadata=metadata)
+        _append_event(conn, task_id, "submitted_for_review", {
+            "writer_assignee": writer, "reviewer_assignee": reviewer,
+            "writer_run_id": run_id,
+        }, run_id=run_id)
+    return True
+
+
+def revise_from_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Return review work to its original writer without creating children."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT writer_assignee FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if row is None or not row["writer_assignee"]:
+            return False
+        sql = """UPDATE tasks SET status='ready', assignee=writer_assignee,
+                 claim_lock=NULL, claim_expires=NULL, worker_pid=NULL
+                 WHERE id=? AND status IN ('running', 'review')"""
+        params: tuple = (task_id,)
+        if expected_run_id is not None:
+            sql += " AND current_run_id=?"
+            params += (int(expected_run_id),)
+        if conn.execute(sql, params).rowcount != 1:
+            return False
+        run_id = _end_run(conn, task_id, outcome="revise", status="done", summary=reason)
+        _append_event(conn, task_id, "review_revise", {"reason": reason}, run_id=run_id)
     return True
 
 
