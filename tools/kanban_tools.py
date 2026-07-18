@@ -665,6 +665,60 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _handle_submit_for_review(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object/dict")
+    summary = args.get("summary")
+    if summary:
+        summary = redact_sensitive_text(str(summary), force=True)
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.submit_for_review(
+                conn, tid, summary=summary, metadata=_stamp_worker_session_metadata(tid, metadata),
+                reviewer_assignee=args.get("reviewer_assignee"), expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(f"could not submit {tid} for review (wrong state or stale run)")
+            return _ok(task_id=tid, status="review")
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.exception("kanban_submit_for_review failed")
+        return tool_error(f"kanban_submit_for_review: {exc}")
+
+
+def _handle_revise(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = args.get("reason")
+    if reason:
+        reason = redact_sensitive_text(str(reason), force=True)
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.revise_from_review(conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            if not ok:
+                return tool_error(f"could not revise {tid} (not an active review run or stale run)")
+            return _ok(task_id=tid, status="ready")
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.exception("kanban_revise failed")
+        return tool_error(f"kanban_revise: {exc}")
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
@@ -1331,6 +1385,29 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SUBMIT_FOR_REVIEW_SCHEMA = {
+    "name": "kanban_submit_for_review",
+    "description": "Submit this implementation run to the native review lane. Idempotent retries do not create another reviewer run.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "summary": {"type": "string", "description": "Implementation and verification handoff."},
+        "metadata": {"type": "object", "description": "Structured writer evidence."},
+        "reviewer_assignee": {"type": "string", "description": "Optional reviewer profile."},
+        "board": _board_schema_prop(),
+    }, "required": []},
+}
+
+KANBAN_REVISE_SCHEMA = {
+    "name": "kanban_revise",
+    "description": "Reviewer-only outcome: return the active review run to its original writer with a concrete reason.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "reason": {"type": "string", "description": "Required revision evidence for the writer."},
+        "board": _board_schema_prop(),
+    }, "required": ["reason"]},
+}
+
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -1606,6 +1683,24 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_submit_for_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_FOR_REVIEW_SCHEMA,
+    handler=_handle_submit_for_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_revise",
+    toolset="kanban",
+    schema=KANBAN_REVISE_SCHEMA,
+    handler=_handle_revise,
+    check_fn=_check_kanban_mode,
+    emoji="↩",
 )
 
 registry.register(

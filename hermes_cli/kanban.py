@@ -533,6 +533,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_submit_review = sub.add_parser(
+        "submit-for-review", aliases=["submit_review"],
+        help="Hand a running implementation run to the native review lane",
+    )
+    p_submit_review.add_argument("task_id")
+    p_submit_review.add_argument("--summary", default=None)
+    p_submit_review.add_argument("--metadata", default=None, help="JSON object stored on the writer run")
+    p_submit_review.add_argument("--reviewer", default=None, help="Reviewer profile (default: default)")
+    p_submit_review.add_argument("--expected-run-id", type=int, default=None,
+                                 help="Require this active run id; prevents stale transitions")
+
+    p_revise = sub.add_parser("revise", help="Return an active review run to its original writer")
+    p_revise.add_argument("task_id")
+    p_revise.add_argument("--reason", default=None)
+    p_revise.add_argument("--expected-run-id", type=int, default=None,
+                          help="Require this active reviewer run id")
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -952,6 +969,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
+            "submit-for-review": _cmd_submit_for_review,
+            "submit_review": _cmd_submit_for_review,
+            "revise": _cmd_revise,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1906,6 +1926,42 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_submit_for_review(args: argparse.Namespace) -> int:
+    try:
+        metadata = json.loads(args.metadata) if args.metadata else None
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("--metadata must be a JSON object")
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"kanban: --metadata: {exc}", file=sys.stderr)
+        return 2
+    expected = args.expected_run_id
+    if expected is None:
+        expected = _worker_run_id_for(args.task_id)
+    with kb.connect_closing() as conn:
+        ok = kb.submit_for_review(conn, args.task_id, summary=args.summary,
+                                  metadata=metadata, reviewer_assignee=args.reviewer,
+                                  expected_run_id=expected)
+    if not ok:
+        print(f"cannot submit {args.task_id} for review (wrong state or stale run)", file=sys.stderr)
+        return 1
+    print(f"Submitted {args.task_id} for review")
+    return 0
+
+
+def _cmd_revise(args: argparse.Namespace) -> int:
+    expected = args.expected_run_id
+    if expected is None:
+        expected = _worker_run_id_for(args.task_id)
+    with kb.connect_closing() as conn:
+        ok = kb.revise_from_review(conn, args.task_id, reason=args.reason,
+                                   expected_run_id=expected)
+    if not ok:
+        print(f"cannot revise {args.task_id} (not an active review run or stale run)", file=sys.stderr)
+        return 1
+    print(f"Returned {args.task_id} to its writer")
+    return 0
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:

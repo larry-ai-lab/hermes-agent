@@ -62,3 +62,31 @@ def test_true_block_does_not_enter_review(review_db: None) -> None:
         assert kb.block_task(conn, task_id, reason="needs credentials")
         assert kb.get_task(conn, task_id).status == "blocked"
         assert not kb.submit_for_review(conn, task_id)
+
+
+def test_shadow_review_is_deterministic_and_does_not_mutate(review_db: None) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="spark")
+        assert kb.claim_task(conn, task_id)
+        assert kb.submit_for_review(conn, task_id)
+        before = kb.get_task(conn, task_id)
+        result = kb.dispatch_once(conn, native_review_enabled=False, native_review_shadow=True)
+        assert result.review_shadow == [{"task_id": task_id, "assignee": "default", "reviewer_assignee": "default"}]
+        after = kb.get_task(conn, task_id)
+        assert after.status == before.status == "review"
+        assert after.current_run_id == before.current_run_id
+
+
+def test_missing_review_prerequisite_audits_without_claim_loop(review_db: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kb, "_review_prerequisite_error", lambda _: "canonical review skill unavailable")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="spark")
+        assert kb.claim_task(conn, task_id)
+        assert kb.submit_for_review(conn, task_id)
+        first = kb.dispatch_once(conn, native_review_enabled=True)
+        second = kb.dispatch_once(conn, native_review_enabled=True)
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id=? AND kind='review_dispatch_blocked'", (task_id,)).fetchall()
+        assert task_id in first.skipped_nonspawnable
+        assert task_id in second.skipped_nonspawnable
+        assert len(events) == 1
+        assert kb.get_task(conn, task_id).status == "review"

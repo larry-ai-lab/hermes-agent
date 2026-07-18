@@ -4621,7 +4621,8 @@ def revise_from_review(
         if row is None or not row["writer_assignee"]:
             return False
         sql = """UPDATE tasks SET status='ready', assignee=writer_assignee,
-                 claim_lock=NULL, claim_expires=NULL, worker_pid=NULL
+                 claim_lock=NULL, claim_expires=NULL, worker_pid=NULL,
+                 reviewer_assignee=NULL
                  WHERE id=? AND status IN ('running', 'review')"""
         params: tuple = (task_id,)
         if expected_run_id is not None:
@@ -4632,6 +4633,59 @@ def revise_from_review(
         run_id = _end_run(conn, task_id, outcome="revise", status="done", summary=reason)
         _append_event(conn, task_id, "review_revise", {"reason": reason}, run_id=run_id)
     return True
+
+
+NATIVE_REVIEW_SKILL = "sdlc-review"
+
+
+def native_review_shadow_report(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    """Return a stable, read-only list of review candidates for shadow rollout."""
+    rows = conn.execute(
+        "SELECT id, assignee, reviewer_assignee FROM tasks "
+        "WHERE status='review' AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC, id ASC"
+    ).fetchall()
+    return [{"task_id": row["id"], "assignee": row["assignee"] or "",
+             "reviewer_assignee": row["reviewer_assignee"] or ""} for row in rows]
+
+
+def _review_prerequisite_error(assignee: Optional[str]) -> Optional[str]:
+    """Fail closed before a review claim when its runtime cannot be proven."""
+    if not assignee:
+        return "reviewer profile is not assigned"
+    try:
+        from hermes_cli.profiles import profile_exists
+        if not profile_exists(assignee):
+            return f"reviewer profile {assignee!r} is unavailable"
+    except Exception as exc:
+        return f"reviewer profile validation failed: {exc}"
+    try:
+        from hermes_constants import get_default_hermes_root
+        root = get_default_hermes_root()
+        roots = [root / "skills"]
+        if assignee != "default":
+            roots.insert(0, root / "profiles" / assignee / "skills")
+        if not any((base / NATIVE_REVIEW_SKILL / "SKILL.md").is_file() for base in roots):
+            return f"canonical review skill {NATIVE_REVIEW_SKILL!r} is unavailable"
+    except Exception as exc:
+        return f"canonical review skill validation failed: {exc}"
+    return None
+
+
+def _record_review_dispatch_blocked(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    """Audit a missing prerequisite once; repeated ticks must not spam events."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='review_dispatch_blocked' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row:
+        try:
+            if json.loads(row["payload"] or "{}").get("reason") == reason:
+                return
+        except (TypeError, ValueError):
+            pass
+    with write_txn(conn):
+        _append_event(conn, task_id, "review_dispatch_blocked", {"reason": reason})
 
 
 def block_task(
@@ -5840,6 +5894,8 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    review_shadow: list[dict[str, str]] = field(default_factory=list)
+    """Read-only native-review candidates observed during a shadow tick."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7038,6 +7094,8 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    native_review_enabled: bool = True,
+    native_review_shadow: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7072,6 +7130,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            native_review_enabled=native_review_enabled,
+            native_review_shadow=native_review_shadow,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7088,6 +7148,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            native_review_enabled=native_review_enabled,
+            native_review_shadow=native_review_shadow,
         )
 
 
@@ -7104,6 +7166,8 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    native_review_enabled: bool = True,
+    native_review_shadow: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7419,6 +7483,12 @@ def _dispatch_once_locked(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
+    # Native review is opt-in. Shadow mode reports candidates but never claims,
+    # changes status, or spawns a process on an installed board.
+    if native_review_shadow:
+        result.review_shadow = native_review_shadow_report(conn)
+    if not native_review_enabled:
+        return result
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
@@ -7430,12 +7500,11 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        prerequisite_error = _review_prerequisite_error(row["assignee"])
+        if prerequisite_error:
             result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                _record_review_dispatch_blocked(conn, row["id"], prerequisite_error)
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -7467,7 +7536,7 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = [NATIVE_REVIEW_SKILL]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

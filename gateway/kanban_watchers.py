@@ -929,6 +929,11 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Explicit rollout gate. Shadow mode only populates a read-only
+        # DispatchResult report; it never claims or spawns review tasks.
+        native_review_enabled = bool(kanban_cfg.get("native_review_enabled", False))
+        native_review_shadow = bool(kanban_cfg.get("native_review_shadow", False))
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1022,6 +1027,8 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    native_review_enabled=native_review_enabled,
+                    native_review_shadow=native_review_shadow,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
