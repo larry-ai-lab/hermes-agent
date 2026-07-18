@@ -75,6 +75,7 @@ import hashlib
 import json
 import os
 import re
+import random
 import secrets
 import shutil
 import sqlite3
@@ -284,6 +285,43 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+
+
+def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
+    """Render the age of an epoch-seconds timestamp as a coarse, human-
+    readable string like ``just now``, ``18h ago``, ``3d ago``.
+
+    Workers read parent handoffs, comments, and prior-attempt summaries as
+    if they describe *current* state. A bare absolute timestamp
+    (``2026-06-25 14:30``) doesn't make an LLM reason about staleness — it
+    reads the content as fact regardless of how old it is. A relative age
+    ("18h ago") is the signal that prompts the worker to re-verify against
+    the live source before acting on stale sibling work. Returns an empty
+    string for missing/invalid timestamps so callers can append
+    unconditionally.
+    """
+    if ts is None:
+        return ""
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        return ""
+    if now is None:
+        now = int(time.time())
+    delta = now - ts
+    if delta < 0:
+        # Clock skew across machines/profiles — don't claim "in the future".
+        return "just now"
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        m = delta // 60
+        return f"{m}m ago"
+    if delta < 86400:
+        h = delta // 3600
+        return f"{h}h ago"
+    d = delta // 86400
+    return f"{d}d ago"
 
 
 # ---------------------------------------------------------------------------
@@ -876,6 +914,11 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # The implementation owner remains durable while a separate reviewer owns
+    # a review run. ``assignee`` switches to the active lane owner only while
+    # status=review; these fields preserve the boundary for audit and revise.
+    writer_assignee: Optional[str] = None
+    reviewer_assignee: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -959,6 +1002,12 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            writer_assignee=(
+                row["writer_assignee"] if "writer_assignee" in keys else None
+            ),
+            reviewer_assignee=(
+                row["reviewer_assignee"] if "reviewer_assignee" in keys else None
             ),
         )
 
@@ -1137,7 +1186,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Durable lane ownership. The writer identity is captured at native review
+    -- submission; the reviewer becomes active only for the review run.
+    writer_assignee      TEXT,
+    reviewer_assignee    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1947,6 +2000,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "writer_assignee" not in cols:
+        _add_column_if_missing(conn, "tasks", "writer_assignee", "writer_assignee TEXT")
+    if "reviewer_assignee" not in cols:
+        _add_column_if_missing(conn, "tasks", "reviewer_assignee", "reviewer_assignee TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2233,6 +2290,38 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
         pass  # I/O errors during check are non-fatal; let normal ops continue
 
 
+# SQLite's own busy_timeout uses a near-deterministic backoff, so concurrent
+# writers re-collide in lockstep under a stampede. A jittered retry on the
+# transaction boundary breaks that convoy. Mirrors state.db's _execute_write:
+# a fixed 20-150ms jitter band (a 20ms floor prevents a near-zero retry from
+# busy-spinning back into the collision). Only BEGIN IMMEDIATE and COMMIT are
+# retried -- both are idempotent re-issues that touch no transaction body, so a
+# CAS inside write_txn is never replayed. kanban keeps fewer retries than
+# state.db (5 vs 15) because its 120s busy_timeout already absorbs most waits;
+# the retry is the backstop for the tail SQLite returns BUSY on immediately.
+_BUSY_MAX_RETRIES = 5
+_BUSY_RETRY_MIN_S = 0.020  # 20ms
+_BUSY_RETRY_MAX_S = 0.150  # 150ms
+
+
+def _is_busy_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "database is locked" in str(exc).lower()
+        or "database is busy" in str(exc).lower()
+    )
+
+
+def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
+    for attempt in range(_BUSY_MAX_RETRIES + 1):
+        try:
+            conn.execute(sql)
+            return
+        except sqlite3.OperationalError as exc:
+            if not _is_busy_error(exc) or attempt == _BUSY_MAX_RETRIES:
+                raise
+            time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
     """Context manager for an IMMEDIATE write transaction.
@@ -2245,7 +2334,7 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
-    conn.execute("BEGIN IMMEDIATE")
+    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
@@ -2258,7 +2347,16 @@ def write_txn(conn: sqlite3.Connection):
             pass
         raise
     else:
-        conn.execute("COMMIT")
+        try:
+            _execute_boundary_with_retry(conn, "COMMIT")
+        except Exception:
+            # COMMIT exhausted retries with the txn still open; roll back so the
+            # connection isn't poisoned for the next BEGIN IMMEDIATE.
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -4459,6 +4557,137 @@ def edit_completed_task_result(
     return True
 
 
+def submit_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    reviewer_assignee: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Durably hand an implementation run to the native ``review`` lane.
+
+    Unlike :func:`complete_task`, this retains workspaces and does not promote
+    dependents. Repeated submission is a no-op, so retrying delivery cannot
+    create a second reviewer run.
+    """
+    reviewer = _canonical_assignee(reviewer_assignee or "default")
+    if not reviewer:
+        raise ValueError("reviewer_assignee is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        writer = row["assignee"]
+        sql = """
+            UPDATE tasks SET status='review', assignee=?, writer_assignee=?,
+                reviewer_assignee=?, claim_lock=NULL, claim_expires=NULL,
+                worker_pid=NULL, block_kind=NULL
+            WHERE id=? AND status IN ('running', 'ready')
+        """
+        params: tuple = (reviewer, writer, reviewer, task_id)
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params += (int(expected_run_id),)
+        if conn.execute(sql, params).rowcount != 1:
+            return False
+        run_id = _end_run(conn, task_id, outcome="submitted_for_review",
+                          status="review", summary=summary, metadata=metadata)
+        if run_id is None:
+            run_id = _synthesize_ended_run(conn, task_id,
+                outcome="submitted_for_review", summary=summary, metadata=metadata)
+        _append_event(conn, task_id, "submitted_for_review", {
+            "writer_assignee": writer, "reviewer_assignee": reviewer,
+            "writer_run_id": run_id,
+        }, run_id=run_id)
+    return True
+
+
+def revise_from_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Return review work to its original writer without creating children."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT writer_assignee FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if row is None or not row["writer_assignee"]:
+            return False
+        sql = """UPDATE tasks SET status='ready', assignee=writer_assignee,
+                 claim_lock=NULL, claim_expires=NULL, worker_pid=NULL,
+                 reviewer_assignee=NULL
+                 WHERE id=? AND status IN ('running', 'review')"""
+        params: tuple = (task_id,)
+        if expected_run_id is not None:
+            sql += " AND current_run_id=?"
+            params += (int(expected_run_id),)
+        if conn.execute(sql, params).rowcount != 1:
+            return False
+        run_id = _end_run(conn, task_id, outcome="revise", status="done", summary=reason)
+        _append_event(conn, task_id, "review_revise", {"reason": reason}, run_id=run_id)
+    return True
+
+
+NATIVE_REVIEW_SKILL = "sdlc-review"
+
+
+def native_review_shadow_report(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    """Return a stable, read-only list of review candidates for shadow rollout."""
+    rows = conn.execute(
+        "SELECT id, assignee, reviewer_assignee FROM tasks "
+        "WHERE status='review' AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC, id ASC"
+    ).fetchall()
+    return [{"task_id": row["id"], "assignee": row["assignee"] or "",
+             "reviewer_assignee": row["reviewer_assignee"] or ""} for row in rows]
+
+
+def _review_prerequisite_error(assignee: Optional[str]) -> Optional[str]:
+    """Fail closed before a review claim when its runtime cannot be proven."""
+    if not assignee:
+        return "reviewer profile is not assigned"
+    try:
+        from hermes_cli.profiles import profile_exists
+        if not profile_exists(assignee):
+            return f"reviewer profile {assignee!r} is unavailable"
+    except Exception as exc:
+        return f"reviewer profile validation failed: {exc}"
+    try:
+        from hermes_constants import get_default_hermes_root
+        root = get_default_hermes_root()
+        roots = [root / "skills"]
+        if assignee != "default":
+            roots.insert(0, root / "profiles" / assignee / "skills")
+        if not any((base / NATIVE_REVIEW_SKILL / "SKILL.md").is_file() for base in roots):
+            return f"canonical review skill {NATIVE_REVIEW_SKILL!r} is unavailable"
+    except Exception as exc:
+        return f"canonical review skill validation failed: {exc}"
+    return None
+
+
+def _record_review_dispatch_blocked(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    """Audit a missing prerequisite once; repeated ticks must not spam events."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='review_dispatch_blocked' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row:
+        try:
+            if json.loads(row["payload"] or "{}").get("reason") == reason:
+                return
+        except (TypeError, ValueError):
+            pass
+    with write_txn(conn):
+        _append_event(conn, task_id, "review_dispatch_blocked", {"reason": reason})
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5665,6 +5894,8 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    review_shadow: list[dict[str, str]] = field(default_factory=list)
+    """Read-only native-review candidates observed during a shadow tick."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6863,6 +7094,8 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    native_review_enabled: bool = True,
+    native_review_shadow: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -6897,6 +7130,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            native_review_enabled=native_review_enabled,
+            native_review_shadow=native_review_shadow,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -6913,6 +7148,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            native_review_enabled=native_review_enabled,
+            native_review_shadow=native_review_shadow,
         )
 
 
@@ -6929,6 +7166,8 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    native_review_enabled: bool = True,
+    native_review_shadow: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7244,6 +7483,12 @@ def _dispatch_once_locked(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
+    # Native review is opt-in. Shadow mode reports candidates but never claims,
+    # changes status, or spawns a process on an installed board.
+    if native_review_shadow:
+        result.review_shadow = native_review_shadow_report(conn)
+    if not native_review_enabled:
+        return result
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
@@ -7255,12 +7500,11 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        prerequisite_error = _review_prerequisite_error(row["assignee"])
+        if prerequisite_error:
             result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                _record_review_dispatch_blocked(conn, row["id"], prerequisite_error)
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -7292,7 +7536,7 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = [NATIVE_REVIEW_SKILL]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -7843,6 +8087,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if not task:
         raise ValueError(f"unknown task {task_id}")
 
+    # Single clock reading shared by every relative-age stamp below, so all
+    # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
+    # by the seconds it takes to build the block).
+    _now = int(time.time())
+
     def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
         """Truncate a string to `limit` chars with a visible ellipsis."""
         if not s:
@@ -7922,9 +8171,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         for offset, run in enumerate(shown):
             idx = first_shown_idx + offset
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
+            age = _relative_age(run.started_at, _now)
+            ts_disp = f"{ts}, {age}" if age else ts
             profile = run.profile or "(unknown)"
             outcome = run.outcome or run.status
-            lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts})")
+            lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
             if run.summary and run.summary.strip():
                 lines.append(_cap(run.summary))
             if run.error and run.error.strip():
@@ -7958,8 +8209,24 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
             if not wrote_header:
                 lines.append("## Parent task results")
+                lines.append(
+                    "_Handoffs from upstream tasks, captured when each parent "
+                    "completed (see age below). These are point-in-time "
+                    "snapshots, not live state — if a result drives your "
+                    "current work and it's not recent, re-verify against the "
+                    "source before acting on it as current._"
+                )
                 wrote_header = True
-            lines.append(f"### {pid}")
+
+            # When did this parent's result get produced? Prefer the
+            # completed run's end time; fall back to the task's completed_at.
+            done_ts = None
+            if run is not None and getattr(run, "ended_at", None):
+                done_ts = run.ended_at
+            elif pt.completed_at:
+                done_ts = pt.completed_at
+            age = _relative_age(done_ts, _now)
+            lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
@@ -7999,9 +8266,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 ts = time.strftime(
                     "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
                 )
+                age = _relative_age(row["ended_at"], _now)
+                ts_disp = f"{ts}, {age}" if age else ts
                 s = (row["summary"] or "").strip().splitlines()
                 first = s[0][:200] if s else "(no summary)"
-                lines.append(f"- {row['id']} — {row['title']} ({ts}): {first}")
+                lines.append(f"- {row['id']} — {row['title']} ({ts_disp}): {first}")
             lines.append("")
 
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
@@ -8023,6 +8292,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
         for c in shown_c:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
+            age = _relative_age(c.created_at, _now)
+            ts_disp = f"{ts}, {age}" if age else ts
             # Render author with explicit "comment from worker" framing so
             # operator-controlled HERMES_PROFILE values like "hermes-system"
             # or "operator" can't be misread by the next worker as a system
@@ -8030,7 +8301,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # Defense-in-depth — the LLM-controlled author-forgery surface
             # was already closed in #22435. See #22452.
             safe_author = (c.author or "").replace("`", "")
-            lines.append(f"comment from worker `{safe_author}` at {ts}:")
+            lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
 

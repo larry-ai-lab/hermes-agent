@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE
+from plugins.dashboard_auth.basic import BasicAuthProvider, hash_password
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
@@ -110,8 +111,11 @@ def test_other_public_api_paths_are_public_under_gate(gated_app, path):
 def test_gated_html_redirects_to_login(gated_app):
     r = gated_app.get("/", follow_redirects=False)
     assert r.status_code == 302
-    # Phase 6: gate carries a ``next=`` so post-login bounces back to /.
-    assert r.headers["location"] in ("/login", "/login?next=%2F")
+    # Phase 1 (cloud-auto-discovery): with a single interactive provider, an
+    # unauthenticated HTML load auto-initiates the OAuth redirect to
+    # /auth/login rather than rendering the /login interstitial. The /login
+    # page remains the fallback (multiple/zero providers, or loop-guard trip).
+    assert r.headers["location"].startswith("/auth/login?provider=stub")
 
 
 def test_gated_auth_providers_is_public(gated_app):
@@ -541,6 +545,56 @@ def _gated_state():
     web_server.app.state.bound_host = prev_host
     web_server.app.state.bound_port = prev_port
     web_server.app.state.auth_required = prev_required
+
+
+def test_password_only_provider_does_not_auto_sso(_gated_state):
+    """A password-only provider must not be selected for auto-SSO.
+
+    Contract: when the only registered provider is password-only (e.g.
+    built-in BasicAuth), unauthenticated HTML requests must land on the
+    normal /login interstitial with a safe ``next=`` path, not the
+    OAuth-initiation endpoint where ``start_login`` would fail.
+    """
+    register_provider(
+        BasicAuthProvider(
+            username="admin",
+            password_hash=hash_password("hunter2"),
+            secret=b"unit-test-secret-16b",
+        )
+    )
+
+    client = _gated_state()
+    r = client.get("/observability", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/login?next=%2Fobservability"
+
+    # Confirm this is not the OAuth route (which would attempt
+    # ``start_login`` on a password-only provider).
+    r2 = client.get(r.headers["location"], follow_redirects=False)
+    assert r2.status_code == 200
+
+
+def test_mixed_password_and_oauth_provider_renders_login(_gated_state):
+    """A mixed provider set must keep chooser UX and not auto-SSO.
+
+    Contract: when more than one session provider exists, the middleware must
+    show /login (and encode next=) so the user chooses the auth path. This
+    applies even when exactly one OAuth provider and one password provider are
+    registered.
+    """
+    register_provider(
+        BasicAuthProvider(
+            username="admin",
+            password_hash=hash_password("hunter2"),
+            secret=b"unit-test-secret-16b",
+        )
+    )
+    register_provider(StubAuthProvider())
+
+    client = _gated_state()
+    r = client.get("/observability", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/login?next=%2Fobservability"
 
 
 def test_unreachable_first_provider_does_not_block_second(_gated_state):
