@@ -25,6 +25,17 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _auto_decompose_task_has_declared_skills(task: Any) -> bool:
+    """Return whether a triage task explicitly declares worker skills.
+
+    Automatic decomposition must not invent a graph for a task whose workers
+    have no stated capability contract.  A profile's ambient defaults are not
+    sufficient: the generated children need reproducible, inspectable skill
+    bindings before they can be launched.
+    """
+    return bool(getattr(task, "skills", None))
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1172,6 +1183,25 @@ class GatewayKanbanWatchersMixin:
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
+                        task = None
+                        try:
+                            conn = _kb.connect(board=slug)
+                            try:
+                                task = _kb.get_task(conn, tid)
+                            finally:
+                                conn.close()
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban auto-decompose: could not inspect %s on board %s (%s)",
+                                tid, slug, exc,
+                            )
+                            continue
+                        if not _auto_decompose_task_has_declared_skills(task):
+                            logger.info(
+                                "kanban auto-decompose [%s]: %s skipped; no explicit task skills",
+                                slug, tid,
+                            )
+                            continue
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(

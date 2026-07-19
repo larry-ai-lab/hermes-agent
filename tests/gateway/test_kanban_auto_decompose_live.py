@@ -9,9 +9,22 @@ called every tick, reading the current config.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from gateway.kanban_watchers import _resolve_auto_decompose_settings
+from gateway.kanban_watchers import (
+    _auto_decompose_task_has_declared_skills,
+    _resolve_auto_decompose_settings,
+)
+
+
+def test_auto_decompose_requires_explicit_task_skills():
+    assert _auto_decompose_task_has_declared_skills(SimpleNamespace(skills=None)) is False
+    assert _auto_decompose_task_has_declared_skills(SimpleNamespace(skills=[])) is False
+    assert _auto_decompose_task_has_declared_skills(
+        SimpleNamespace(skills=["bmc-editorial-guard"])
+    ) is True
 
 
 def test_disabled_by_default_when_key_absent():
