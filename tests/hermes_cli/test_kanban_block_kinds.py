@@ -145,6 +145,18 @@ def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
         assert t.block_kind == "dependency"
 
 
+def test_controller_can_escalate_todo_to_capability_block(kanban_home: Path) -> None:
+    """A resolved parent gate must not force an unchanged capability retry."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.block_task(conn, child, reason="missing capability", kind="capability")
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+
+
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
     with kb.connect_closing() as conn:
