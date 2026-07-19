@@ -39,7 +39,8 @@ def _resolve_auto_decompose_settings(
 
     Fails **safe**: if the config read raises, return ``(False, 3)`` — a
     transient read error must never re-enable a feature the user turned off,
-    nor fall back to the burst-prone default-on behaviour. ``per_tick`` is
+    nor enable a feature without explicit approval. Auto-decompose is opt-in: an
+    absent setting is disabled. ``per_tick`` is
     clamped to ``>= 1``.
     """
     try:
@@ -47,7 +48,7 @@ def _resolve_auto_decompose_settings(
     except Exception:
         return False, 3
     kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    enabled = bool(kcfg.get("auto_decompose", True))
+    enabled = bool(kcfg.get("auto_decompose", False))
     try:
         per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
     except (TypeError, ValueError):

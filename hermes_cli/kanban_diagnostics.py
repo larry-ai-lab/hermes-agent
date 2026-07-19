@@ -301,8 +301,8 @@ def triage_aux_status(config: Optional[dict]) -> Optional[dict]:
         decomposer_explicit = _aux_slot_explicit(aux.get("kanban_decomposer"))
         specifier_explicit = _aux_slot_explicit(aux.get("triage_specifier"))
 
-    # ``auto_decompose`` defaults to True per kanban DEFAULT_CONFIG.
-    auto_decompose = True
+    # ``auto_decompose`` is explicit opt-in per kanban DEFAULT_CONFIG.
+    auto_decompose = False
     if isinstance(kanban_cfg, dict) and "auto_decompose" in kanban_cfg:
         auto_decompose = bool(kanban_cfg.get("auto_decompose"))
 

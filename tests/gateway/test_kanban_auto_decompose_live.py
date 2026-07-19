@@ -14,9 +14,9 @@ import pytest
 from gateway.kanban_watchers import _resolve_auto_decompose_settings
 
 
-def test_enabled_by_default_when_key_absent():
+def test_disabled_by_default_when_key_absent():
     enabled, per_tick = _resolve_auto_decompose_settings(lambda: {"kanban": {}})
-    assert enabled is True
+    assert enabled is False
     assert per_tick == 3
 
 
@@ -68,9 +68,9 @@ def test_config_read_error_fails_safe_disabled():
 
 def test_non_dict_config_fails_safe():
     enabled, _ = _resolve_auto_decompose_settings(lambda: None)
-    assert enabled is True  # no kanban key → default-on (not an error path)
+    assert enabled is False  # no explicit opt-in → safe default
     enabled2, _ = _resolve_auto_decompose_settings(lambda: ["not", "a", "dict"])
-    assert enabled2 is True
+    assert enabled2 is False
 
 
 def test_live_toggle_takes_effect_between_calls():
