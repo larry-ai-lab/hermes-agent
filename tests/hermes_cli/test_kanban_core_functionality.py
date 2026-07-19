@@ -89,6 +89,22 @@ def test_no_idempotency_key_never_collides(kanban_home):
         conn.close()
 
 
+def test_new_task_always_gets_default_execution_steps(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="task without a plan")
+        task = kb.get_task(conn, tid)
+        assert "執行步驟" in task.body
+        assert "1. 確認範圍、前置依賴與完成條件" in task.body
+        assert "3. 驗證結果、處理阻擋，並回報或交接下一張卡" in task.body
+
+        explicit = "執行步驟\n1. Inspect\n2. Verify"
+        explicit_id = kb.create_task(conn, title="task with a plan", body=explicit)
+        assert kb.get_task(conn, explicit_id).body == explicit
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
 # ---------------------------------------------------------------------------

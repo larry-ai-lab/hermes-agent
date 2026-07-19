@@ -2384,6 +2384,31 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_DEFAULT_EXECUTION_STEPS = (
+    "確認範圍、前置依賴與完成條件",
+    "依任務內容執行，並保留可驗證的關鍵證據",
+    "驗證結果、處理阻擋，並回報或交接下一張卡",
+)
+
+
+def ensure_execution_steps(body: Optional[str]) -> str:
+    """Return a task body that always exposes a minimal execution plan.
+
+    Kanban cards may be created from the CLI, plugins, automation, or a
+    decomposer.  The board must never depend on a specific creator to remember
+    the progress markup consumed by the status monitor.  Explicit plans are
+    preserved verbatim; missing plans receive a truthful, generic three-step
+    lifecycle which workers can refine through progress comments.
+    """
+    text = (body or "").rstrip()
+    if "執行步驟" in text:
+        return text
+    plan = "\n".join(
+        ["執行步驟", *[f"{i}. {step}" for i, step in enumerate(_DEFAULT_EXECUTION_STEPS, 1)]]
+    )
+    return f"{text}\n\n{plan}" if text else plan
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2433,6 +2458,7 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    body = ensure_execution_steps(body)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -5432,7 +5458,7 @@ def decompose_triage_task(
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
-            body = child.get("body")
+            body = ensure_execution_steps(child.get("body"))
             assignee = _canonical_assignee(child.get("assignee"))
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
