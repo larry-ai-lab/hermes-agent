@@ -3878,6 +3878,10 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+    # Acceptance cards are derived summary nodes.  Refresh after the claim
+    # transaction commits so a ready -> running child is visible immediately.
+    if claimed and claimed.acceptance_id:
+        refresh_acceptance_status(conn, claimed.acceptance_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
