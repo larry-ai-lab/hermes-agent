@@ -4117,6 +4117,52 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _auto_archive_explicit_superseded(
+    conn: sqlite3.Connection,
+    *,
+    completed_task_id: str,
+    task_ids: object,
+) -> dict[str, list[str]]:
+    """Archive explicit stale cards after a successful release/closeout.
+
+    This is deliberately opt-in through completion metadata rather than a
+    graph-wide guess.  Only inactive ``todo``/``blocked``/``triage`` cards may
+    be archived, and a candidate with unfinished children outside the supplied
+    closeout set is skipped so archiving cannot accidentally unblock work that
+    remains live.
+    """
+    requested = []
+    if isinstance(task_ids, (list, tuple, set)):
+        requested = [str(item).strip() for item in task_ids if str(item).strip()]
+    targets = list(dict.fromkeys(task_id for task_id in requested if task_id != completed_task_id))
+    target_set = set(targets)
+    archived: list[str] = []
+    skipped: list[str] = []
+    for target_id in targets:
+        task = get_task(conn, target_id)
+        if task is None or task.status not in {"todo", "blocked", "triage"}:
+            skipped.append(target_id)
+            continue
+        children = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (target_id,)
+        ).fetchall()
+        external_live_child = False
+        for row in children:
+            child_id = row["child_id"]
+            child = get_task(conn, child_id)
+            if child and child.status not in {"done", "archived"} and child_id not in target_set:
+                external_live_child = True
+                break
+        if external_live_child:
+            skipped.append(target_id)
+            continue
+        if archive_task(conn, target_id):
+            archived.append(target_id)
+        else:
+            skipped.append(target_id)
+    return {"archived": archived, "skipped": skipped}
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4311,6 +4357,17 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    # A release/controller can opt in to cleanup by declaring the stale cards
+    # it supersedes.  Never infer this from graph shape alone: unrelated daily
+    # workflows often share parents or repos with a completed release.
+    if isinstance(metadata, dict) and "auto_archive_superseded" in metadata:
+        closeout = _auto_archive_explicit_superseded(
+            conn,
+            completed_task_id=task_id,
+            task_ids=metadata.get("auto_archive_superseded"),
+        )
+        with write_txn(conn):
+            _append_event(conn, task_id, "auto_closeout", closeout, run_id=run_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.

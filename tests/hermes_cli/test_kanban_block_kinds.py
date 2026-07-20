@@ -175,6 +175,36 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Explicit closeout cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_completion_archives_only_explicit_inactive_superseded_tasks(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        release = _running_task(conn, title="release")
+        stale = kb.create_task(conn, title="stale", assignee="worker")
+        kb.block_task(conn, stale, reason="superseded", kind="capability")
+        guarded_parent = kb.create_task(conn, title="guarded", assignee="worker")
+        kb.block_task(conn, guarded_parent, reason="superseded", kind="capability")
+        live_child = kb.create_task(
+            conn, title="live child", assignee="worker", parents=[guarded_parent]
+        )
+
+        assert kb.complete_task(
+            conn,
+            release,
+            result="released",
+            metadata={"auto_archive_superseded": [stale, guarded_parent]},
+        )
+        assert kb.get_task(conn, stale).status == "archived"
+        # The second candidate has an unfinished child outside the closeout set.
+        assert kb.get_task(conn, guarded_parent).status == "blocked"
+        events = [e for e in kb.list_events(conn, release) if e.kind == "auto_closeout"]
+        assert events and stale in (events[-1].payload or {}).get("archived", [])
+        assert guarded_parent in (events[-1].payload or {}).get("skipped", [])
+
+
+# ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------
 
