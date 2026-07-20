@@ -101,6 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_TASK_KINDS = {"work", "acceptance", "decision"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -122,7 +123,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "needs_decision", "capability", "transient"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -915,6 +916,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Structural containment is deliberately separate from task_links: links
+    # are scheduling prerequisites, while acceptance_id only groups atomic
+    # work beneath a non-dispatched acceptance card.
+    task_kind: str = "work"
+    acceptance_id: Optional[str] = None
+    capability_fingerprint: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -998,6 +1005,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            task_kind=(row["task_kind"] if "task_kind" in keys and row["task_kind"] else "work"),
+            acceptance_id=(row["acceptance_id"] if "acceptance_id" in keys else None),
+            capability_fingerprint=(
+                row["capability_fingerprint"] if "capability_fingerprint" in keys else None
             ),
         )
 
@@ -1176,13 +1188,26 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Structural role. Acceptance and decision cards are display/control
+    -- nodes; only work cards are dispatchable.
+    task_kind            TEXT NOT NULL DEFAULT 'work',
+    acceptance_id        TEXT,
+    capability_fingerprint TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+-- Many blocked work cards can point to the same controller decision. This is
+-- intentionally separate from task_links, whose only meaning is scheduling.
+CREATE TABLE IF NOT EXISTS task_decision_links (
+    decision_id TEXT NOT NULL,
+    task_id     TEXT NOT NULL,
+    PRIMARY KEY (decision_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -1987,6 +2012,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # DAG v2 separates visual/acceptance containment from prerequisite links.
+    # Existing cards remain ordinary work cards and therefore retain exactly
+    # their previous dispatch behaviour.
+    if "task_kind" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "task_kind", "task_kind TEXT NOT NULL DEFAULT 'work'"
+        )
+    if "acceptance_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "acceptance_id", "acceptance_id TEXT")
+    if "capability_fingerprint" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "capability_fingerprint", "capability_fingerprint TEXT"
+        )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_decision_links "
+        "(decision_id TEXT NOT NULL, task_id TEXT NOT NULL, "
+        "PRIMARY KEY (decision_id, task_id))"
+    )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2000,6 +2044,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_acceptance_id ON tasks(acceptance_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_decision_fingerprint "
+        "ON tasks(capability_fingerprint)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2433,6 +2484,9 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    task_kind: str = "work",
+    acceptance_id: Optional[str] = None,
+    capability_fingerprint: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2458,13 +2512,22 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
-    body = ensure_execution_steps(body)
+    # A card is an atomic unit of work, not a second copy of the workflow.
+    # The real execution graph is expressed by dependency and containment
+    # fields below, so never inject synthetic numbered "steps" into new cards.
+    body = (body or "").rstrip() or None
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    if task_kind not in VALID_TASK_KINDS:
+        raise ValueError(f"task_kind must be one of {sorted(VALID_TASK_KINDS)}")
+    if task_kind != "work" and parents:
+        raise ValueError("only work cards may have prerequisite parents")
+    if task_kind == "decision" and acceptance_id:
+        raise ValueError("decision cards must remain top-level")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -2605,10 +2668,21 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                if acceptance_id:
+                    acceptance = conn.execute(
+                        "SELECT task_kind FROM tasks WHERE id = ?", (acceptance_id,)
+                    ).fetchone()
+                    if acceptance is None or acceptance["task_kind"] != "acceptance":
+                        raise ValueError("acceptance_id must refer to an acceptance card")
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status == "blocked":
+                if task_kind == "decision":
+                    task_status = "blocked"
+                elif task_kind == "acceptance":
+                    # Derived by refresh_acceptance_status once children exist.
+                    task_status = "todo"
+                elif initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
@@ -2662,8 +2736,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        task_kind, acceptance_id, capability_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2686,6 +2761,9 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        task_kind,
+                        acceptance_id,
+                        capability_fingerprint,
                     ),
                 )
                 for pid in parents:
@@ -2705,6 +2783,8 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "task_kind": task_kind,
+                        "acceptance_id": acceptance_id,
                     },
                 )
             return task_id
@@ -2714,6 +2794,179 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def refresh_acceptance_status(conn: sqlite3.Connection, acceptance_id: str) -> Optional[str]:
+    """Derive an acceptance card's display state from its contained work.
+
+    Containment never creates a scheduler edge.  The acceptance card is a
+    non-dispatched summary node: it is done only after every contained work
+    card is terminal, blocked when any child (or its decision) needs help,
+    and otherwise mirrors the most advanced live child state.
+    """
+    with write_txn(conn):
+        root = conn.execute(
+            "SELECT id, task_kind, status FROM tasks WHERE id = ?", (acceptance_id,)
+        ).fetchone()
+        if root is None or root["task_kind"] != "acceptance":
+            return None
+        children = conn.execute(
+            "SELECT id, status FROM tasks WHERE acceptance_id = ? AND task_kind = 'work'",
+            (acceptance_id,),
+        ).fetchall()
+        if not children:
+            status = "todo"
+        else:
+            states = {row["status"] for row in children}
+            unresolved_decision = conn.execute(
+                "SELECT 1 FROM task_decision_links dl "
+                "JOIN tasks d ON d.id = dl.decision_id "
+                "JOIN tasks w ON w.id = dl.task_id "
+                "WHERE w.acceptance_id = ? AND d.status NOT IN ('done', 'archived') "
+                "LIMIT 1",
+                (acceptance_id,),
+            ).fetchone()
+            if states.issubset({"done", "archived"}):
+                status = "done"
+            elif unresolved_decision or "blocked" in states or "triage" in states:
+                status = "blocked"
+            elif "running" in states:
+                status = "running"
+            elif "ready" in states or "review" in states:
+                status = "ready"
+            else:
+                status = "todo"
+        if root["status"] != status:
+            conn.execute(
+                "UPDATE tasks SET status = ?, completed_at = CASE WHEN ? = 'done' "
+                "THEN COALESCE(completed_at, ?) ELSE NULL END WHERE id = ?",
+                (status, status, int(time.time()), acceptance_id),
+            )
+            _append_event(conn, acceptance_id, "acceptance_status", {"status": status})
+        return status
+
+
+def request_capability_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    missing_capability: str,
+    reason: str,
+    options: Optional[list[str]] = None,
+    fingerprint: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> str:
+    """Block a work card and create/reuse one visible controller decision.
+
+    This is the only worker escape hatch for a missing capability.  It cannot
+    silently fan out an unowned remediation card; a controller must resolve
+    the decision, then the original work card resumes through normal gating.
+    """
+    missing_capability = (missing_capability or "").strip()
+    reason = (reason or "").strip()
+    if not missing_capability or not reason:
+        raise ValueError("missing_capability and reason are required")
+    normalized_options = [str(v).strip() for v in (options or []) if str(v).strip()]
+    if fingerprint is None:
+        fingerprint = hashlib.sha256(
+            missing_capability.casefold().encode("utf-8")
+        ).hexdigest()[:20]
+    now = int(time.time())
+    with write_txn(conn):
+        source = conn.execute(
+            "SELECT id, title, status, task_kind, acceptance_id, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if source is None:
+            raise ValueError(f"unknown task {task_id}")
+        if source["task_kind"] != "work":
+            raise ValueError("only work cards may request a capability decision")
+        if source["status"] in ("done", "archived"):
+            raise ValueError("cannot block a terminal task")
+        if expected_run_id is not None and source["current_run_id"] != int(expected_run_id):
+            raise ValueError("task run no longer owns this task")
+        decision = conn.execute(
+            "SELECT id FROM tasks WHERE task_kind = 'decision' "
+            "AND capability_fingerprint = ? AND status NOT IN ('done', 'archived') "
+            "ORDER BY created_at ASC LIMIT 1",
+            (fingerprint,),
+        ).fetchone()
+        if decision:
+            decision_id = decision["id"]
+        else:
+            decision_id = _new_task_id()
+            options_text = "\n".join(f"- {opt}" for opt in normalized_options) or "- 由 controller 判斷最小可驗證修復"
+            body = (
+                f"缺少能力：{missing_capability}\n\n"
+                f"阻塞原因：{reason}\n\n"
+                f"建議處理：\n{options_text}\n\n"
+                "此卡由 controller 處理；不要派送給一般 worker。"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, "
+                "created_by, created_at, workspace_kind, tenant, task_kind, capability_fingerprint, block_kind) "
+                "VALUES (?, ?, ?, 'controller', 'blocked', 100000, 'kanban-kernel', ?, 'scratch', ?, 'decision', ?, 'needs_decision')",
+                (decision_id, f"待決｜{missing_capability}", body, now, None, fingerprint),
+            )
+            _append_event(conn, decision_id, "decision_created", {"fingerprint": fingerprint})
+        conn.execute(
+            "INSERT OR IGNORE INTO task_decision_links (decision_id, task_id) VALUES (?, ?)",
+            (decision_id, task_id),
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status NOT IN ('done', 'archived')",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("could not block source task")
+        run_id = _end_run(conn, task_id, outcome="blocked", status="blocked", summary=reason)
+        _append_event(
+            conn, task_id, "capability_decision_requested",
+            {"decision_id": decision_id, "fingerprint": fingerprint, "reason": reason},
+            run_id=run_id,
+        )
+        acceptance_id = source["acceptance_id"]
+    if acceptance_id:
+        refresh_acceptance_status(conn, acceptance_id)
+    return decision_id
+
+
+def resolve_capability_decision(
+    conn: sqlite3.Connection, decision_id: str, *, resolution: str
+) -> list[str]:
+    """Close a controller decision and re-gate every source work card."""
+    resolution = (resolution or "").strip()
+    if not resolution:
+        raise ValueError("resolution is required")
+    with write_txn(conn):
+        decision = conn.execute(
+            "SELECT task_kind, status FROM tasks WHERE id = ?", (decision_id,)
+        ).fetchone()
+        if decision is None or decision["task_kind"] != "decision":
+            raise ValueError("decision_id must refer to a decision card")
+        conn.execute(
+            "UPDATE tasks SET status = 'done', result = ?, completed_at = ?, block_kind = NULL "
+            "WHERE id = ? AND status NOT IN ('done', 'archived')",
+            (resolution, int(time.time()), decision_id),
+        )
+        source_rows = conn.execute(
+            "SELECT task_id FROM task_decision_links WHERE decision_id = ?", (decision_id,)
+        ).fetchall()
+        _append_event(conn, decision_id, "decision_resolved", {"resolution": resolution})
+    source_ids = [row["task_id"] for row in source_rows]
+    acceptance_ids: set[str] = set()
+    for source_id in source_ids:
+        source = get_task(conn, source_id)
+        if source and source.status == "blocked" and source.block_kind == "capability":
+            unblock_task(conn, source_id)
+        if source and source.acceptance_id:
+            acceptance_ids.add(source.acceptance_id)
+    for acceptance_id in acceptance_ids:
+        refresh_acceptance_status(conn, acceptance_id)
+    return source_ids
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -3453,7 +3706,8 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND COALESCE(task_kind, 'work') = 'work'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -3531,6 +3785,11 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        kind_row = conn.execute(
+            "SELECT task_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if kind_row is None or kind_row["task_kind"] != "work":
+            return None
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
@@ -4370,6 +4629,9 @@ def complete_task(
             _append_event(conn, task_id, "auto_closeout", closeout, run_id=run_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    completed_task = get_task(conn, task_id)
+    if completed_task and completed_task.acceptance_id:
+        refresh_acceptance_status(conn, completed_task.acceptance_id)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -5174,6 +5436,8 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    if _blocked_task and _blocked_task.acceptance_id:
+        refresh_acceptance_status(conn, _blocked_task.acceptance_id)
     return True
 
 
@@ -5259,9 +5523,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
+    acceptance_id: Optional[str] = None
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id, acceptance_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -5276,6 +5541,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        if stale:
+            acceptance_id = stale["acceptance_id"]
         # Re-gate on parent completion before flipping 'blocked' back to
         # 'ready'. Unconditionally setting status='ready' here bypasses the
         # parent-completion invariant (the dispatcher trusts that column);
@@ -5311,7 +5578,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
         )
-        return True
+    if acceptance_id:
+        refresh_acceptance_status(conn, acceptance_id)
+    return True
 
 
 def specify_triage_task(
@@ -5521,7 +5790,7 @@ def decompose_triage_task(
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
-            body = ensure_execution_steps(child.get("body"))
+            body = (child.get("body") or "").rstrip() or None
             assignee = _canonical_assignee(child.get("assignee"))
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
@@ -5538,8 +5807,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, task_kind, acceptance_id) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, 'work', ?)",
                 (
                     new_id,
                     title,
@@ -5550,6 +5819,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    task_id,
                 ),
             )
             _append_event(
@@ -5577,15 +5847,9 @@ def decompose_triage_task(
         # root waits for the whole graph. Simpler than computing leaves:
         # link root under every child. Cycle-free because the root is
         # only ever a child here, never a parent of children.
-        for cid in child_ids:
-            conn.execute(
-                "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
-                "VALUES (?, ?)",
-                (cid, task_id),
-            )
-
-        # Flip the root: triage -> todo, set assignee to the orchestrator.
-        sets = ["status = 'todo'"]
+        # Structural containment is stored on child.acceptance_id.  Do not
+        # add task_links to the root: those links are scheduler prerequisites.
+        sets = ["status = 'todo'", "task_kind = 'acceptance'"]
         params: list[Any] = []
         if root_assignee is not None:
             sets.append("assignee = ?")
@@ -5604,9 +5868,9 @@ def decompose_triage_task(
                 (
                     task_id,
                     author.strip(),
-                    "Decomposed into "
+                    "Decomposed into acceptance children "
                     + ", ".join(child_ids)
-                    + ". Root will wake when all children complete.",
+                    + ". Root status is derived from those children.",
                     now,
                 ),
             )
@@ -5625,6 +5889,7 @@ def decompose_triage_task(
     # for manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
+    refresh_acceptance_status(conn, task_id)
     return child_ids
 
 

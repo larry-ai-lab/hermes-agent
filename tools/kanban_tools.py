@@ -398,6 +398,9 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "task_kind": t.task_kind,
+                    "acceptance_id": t.acceptance_id,
+                    "capability_fingerprint": t.capability_fingerprint,
                 }
 
             def _run_dict(r):
@@ -1058,11 +1061,18 @@ def _handle_attachments(args: dict, **kw) -> str:
 
 
 def _handle_create(args: dict, **kw) -> str:
-    """Create a child task. Orchestrator workers use this to fan out.
+    """Create a controller-owned atomic work or acceptance card.
 
-    ``parents`` can be a list of task ids; dependency-gated promotion
-    works as usual.
+    Dispatched workers must not fan out replacement/capability cards.  They
+    either complete their scoped work or use ``kanban_request_decision`` to
+    surface a single visible controller decision.
     """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return tool_error(
+            "workers cannot create follow-up cards. The controller owns the "
+            "DAG; use kanban_request_decision for a missing capability, or "
+            "complete/block this card with evidence."
+        )
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1111,6 +1121,8 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    task_kind = args.get("task_kind") or "work"
+    acceptance_id = args.get("acceptance_id")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1159,6 +1171,8 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                task_kind=str(task_kind),
+                acceptance_id=(str(acceptance_id).strip() if acceptance_id else None),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1174,6 +1188,43 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _handle_request_decision(args: dict, **kw) -> str:
+    """Create/reuse a top-level controller decision for this worker's blocker."""
+    task_id = _default_task_id(args.get("task_id"))
+    if not task_id:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK)")
+    ownership_err = _enforce_worker_task_ownership(task_id)
+    if ownership_err:
+        return ownership_err
+    capability = args.get("missing_capability")
+    reason = args.get("reason")
+    if not capability or not str(capability).strip() or not reason or not str(reason).strip():
+        return tool_error("missing_capability and reason are required")
+    options = args.get("options") or []
+    if not isinstance(options, list):
+        return tool_error("options must be a list of controller choices")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            decision_id = kb.request_capability_decision(
+                conn,
+                task_id,
+                missing_capability=redact_sensitive_text(str(capability), force=True),
+                reason=redact_sensitive_text(str(reason), force=True),
+                options=[redact_sensitive_text(str(v), force=True) for v in options],
+                fingerprint=(str(args.get("fingerprint")).strip() if args.get("fingerprint") else None),
+                expected_run_id=_worker_run_id(task_id),
+            )
+            return _ok(task_id=task_id, decision_id=decision_id, status="blocked")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_request_decision: {e}")
+    except Exception as e:
+        logger.exception("kanban_request_decision failed")
+        return tool_error(f"kanban_request_decision: {e}")
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -1715,12 +1766,9 @@ KANBAN_ATTACHMENTS_SCHEMA = {
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
-        "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "Controller-only: create one atomic work card or an acceptance parent. "
+        "Use parents only for real prerequisite dependencies; use acceptance_id "
+        "for visual nesting. Dispatched workers cannot create cards."
     ),
     "parameters": {
         "type": "object",
@@ -1756,6 +1804,15 @@ KANBAN_CREATE_SCHEMA = {
                     "all the researcher task ids when creating a "
                     "synthesizer task."
                 ),
+            },
+            "task_kind": {
+                "type": "string",
+                "enum": ["work", "acceptance"],
+                "description": "work is dispatchable; acceptance is a non-dispatched summary parent.",
+            },
+            "acceptance_id": {
+                "type": "string",
+                "description": "Acceptance parent id for structural nesting only; never a dependency.",
             },
             "tenant": {
                 "type": "string",
@@ -1869,6 +1926,27 @@ KANBAN_CREATE_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
+    },
+}
+
+KANBAN_REQUEST_DECISION_SCHEMA = {
+    "name": "kanban_request_decision",
+    "description": (
+        "When this work card lacks a real capability, block it and create or "
+        "reuse a top-level visible 待決 card for the controller. Do not create "
+        "a capability/follow-up task yourself."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "missing_capability": {"type": "string", "description": "Precise missing ability, access, rule, or contradiction."},
+            "reason": {"type": "string", "description": "Evidence showing why this card cannot continue."},
+            "options": {"type": "array", "items": {"type": "string"}, "description": "Small set of controller choices."},
+            "fingerprint": {"type": "string", "description": "Stable capability key to deduplicate the same open decision."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["missing_capability", "reason"],
     },
 }
 
@@ -2004,6 +2082,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_request_decision",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_DECISION_SCHEMA,
+    handler=_handle_request_decision,
+    check_fn=_check_kanban_mode,
+    emoji="🟣",
 )
 
 registry.register(
